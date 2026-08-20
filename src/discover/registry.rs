@@ -480,6 +480,96 @@ pub fn cmd_has_rtk_disabled_prefix(cmd: &str) -> bool {
     prefix_contains_rtk_disabled(prefix_part)
 }
 
+/// True when this command explicitly routes through RTK.
+///
+/// This covers local invocations (`rtk git status`) and the common remote form
+/// used by agents (`ssh host 'cd /repo && rtk rg foo'`). It intentionally does
+/// not treat every supported raw command as RTK usage; that distinction matters
+/// for agents without a transparent rewrite hook.
+pub fn command_invokes_rtk(cmd: &str) -> bool {
+    let (_, actual_cmd) = strip_disabled_prefix(cmd);
+    let trimmed = actual_cmd.trim();
+    if trimmed == "rtk" || trimmed.starts_with("rtk ") {
+        return true;
+    }
+
+    let tokens = shell_split(trimmed);
+    let Some(first) = tokens.first() else {
+        return false;
+    };
+    if first != "ssh" {
+        return false;
+    }
+
+    ssh_remote_command(&tokens).is_some_and(remote_command_invokes_rtk)
+}
+
+fn remote_command_invokes_rtk(remote: String) -> bool {
+    let trimmed = remote.trim();
+    trimmed == "rtk"
+        || trimmed.starts_with("rtk ")
+        || trimmed.contains("&& rtk ")
+        || trimmed.contains("; rtk ")
+        || trimmed.contains("\nrtk ")
+}
+
+fn ssh_remote_command(tokens: &[String]) -> Option<String> {
+    let mut i = 1;
+    while i < tokens.len() {
+        let token = tokens[i].as_str();
+        if token == "--" {
+            i += 1;
+            break;
+        }
+
+        if token.starts_with('-') {
+            i += if ssh_option_takes_separate_arg(token) && i + 1 < tokens.len() {
+                2
+            } else {
+                1
+            };
+            continue;
+        }
+
+        // First non-option token is the destination. Everything after it is the
+        // remote command.
+        i += 1;
+        break;
+    }
+
+    if i < tokens.len() {
+        Some(tokens[i..].join(" "))
+    } else {
+        None
+    }
+}
+
+fn ssh_option_takes_separate_arg(option: &str) -> bool {
+    matches!(
+        option,
+        "-B" | "-b"
+            | "-c"
+            | "-D"
+            | "-E"
+            | "-e"
+            | "-F"
+            | "-I"
+            | "-i"
+            | "-J"
+            | "-L"
+            | "-l"
+            | "-m"
+            | "-O"
+            | "-o"
+            | "-p"
+            | "-Q"
+            | "-R"
+            | "-S"
+            | "-W"
+            | "-w"
+    )
+}
+
 /// Strip RTK_DISABLED=X and other env prefixes, returns `(env_prefix, actual_command)`.
 pub fn strip_disabled_prefix(cmd: &str) -> (&str, &str) {
     let trimmed = cmd.trim();
@@ -4804,6 +4894,27 @@ mod tests {
         assert!(!cmd_has_rtk_disabled_prefix("git status"));
         assert!(!cmd_has_rtk_disabled_prefix("rtk git status"));
         assert!(!cmd_has_rtk_disabled_prefix("SOME_VAR=1 git status"));
+    }
+
+    #[test]
+    fn test_command_invokes_rtk_local() {
+        assert!(command_invokes_rtk("rtk git status"));
+        assert!(command_invokes_rtk("FOO=1 rtk rg TODO"));
+        assert!(!command_invokes_rtk("git status"));
+        assert!(!command_invokes_rtk("echo rtk git status"));
+    }
+
+    #[test]
+    fn test_command_invokes_rtk_over_ssh() {
+        assert!(command_invokes_rtk("ssh build-host 'rtk rg TODO /tmp'"));
+        assert!(command_invokes_rtk(
+            "ssh -p 22 user@host 'cd /repo && rtk git status'"
+        ));
+        assert!(command_invokes_rtk(
+            "ssh -o StrictHostKeyChecking=accept-new host \"cd /repo; rtk ls\""
+        ));
+        assert!(!command_invokes_rtk("ssh host 'echo rtk git status'"));
+        assert!(!command_invokes_rtk("ssh host git status"));
     }
 
     #[test]

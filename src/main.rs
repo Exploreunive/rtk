@@ -576,7 +576,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Discover missed RTK savings from Claude Code history
+    /// Discover missed RTK savings from AI coding session history
     Discover {
         /// Filter by project path (substring match)
         #[arg(short, long)]
@@ -593,10 +593,17 @@ enum Commands {
         /// Output format: text, json
         #[arg(short, long, default_value = "text")]
         format: String,
+        /// Session provider to scan
+        #[arg(long, value_enum, default_value = "claude")]
+        provider: discover::provider::ProviderKind,
     },
 
-    /// Show RTK adoption across Claude Code sessions
-    Session {},
+    /// Show RTK adoption across AI coding sessions
+    Session {
+        /// Session provider to scan
+        #[arg(long, value_enum, default_value = "claude")]
+        provider: discover::provider::ProviderKind,
+    },
 
     /// Manage telemetry consent and data (RGPD/GDPR)
     Telemetry {
@@ -2274,13 +2281,22 @@ fn run_cli() -> Result<i32> {
             all,
             since,
             format,
+            provider,
         } => {
-            discover::run(project.as_deref(), all, since, limit, &format, cli.verbose)?;
+            discover::run(
+                project.as_deref(),
+                all,
+                since,
+                limit,
+                &format,
+                provider,
+                cli.verbose,
+            )?;
             0
         }
 
-        Commands::Session {} => {
-            analytics::session_cmd::run(cli.verbose)?;
+        Commands::Session { provider } => {
+            analytics::session_cmd::run(provider, cli.verbose)?;
             0
         }
 

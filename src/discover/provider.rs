@@ -1,7 +1,8 @@
-//! Reads Claude Code session logs from disk and streams their command history.
+//! Reads AI coding session logs from disk and streams their command history.
 
 use crate::hooks::init::resolve_claude_dir;
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -37,6 +38,85 @@ pub trait SessionProvider {
         since_days: Option<u64>,
     ) -> Result<Vec<PathBuf>>;
     fn extract_commands(&self, path: &Path) -> Result<Vec<ExtractedCommand>>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ProviderKind {
+    /// Claude Code JSONL sessions under ~/.claude/projects
+    Claude,
+    /// Codex JSONL sessions under ~/.codex/sessions
+    Codex,
+}
+
+impl ProviderKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProviderKind::Claude => "Claude Code",
+            ProviderKind::Codex => "Codex",
+        }
+    }
+}
+
+pub enum SelectedProvider {
+    Claude(ClaudeProvider),
+    Codex(CodexProvider),
+}
+
+impl SelectedProvider {
+    pub fn new(kind: ProviderKind) -> Self {
+        match kind {
+            ProviderKind::Claude => Self::Claude(ClaudeProvider),
+            ProviderKind::Codex => Self::Codex(CodexProvider),
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Claude(_) => ProviderKind::Claude.label(),
+            Self::Codex(_) => ProviderKind::Codex.label(),
+        }
+    }
+
+    pub fn default_project_filter(
+        kind: ProviderKind,
+        project: Option<&str>,
+        all: bool,
+    ) -> Result<Option<String>> {
+        if all {
+            return Ok(None);
+        }
+
+        if let Some(p) = project {
+            return Ok(Some(p.to_string()));
+        }
+
+        let cwd = std::env::current_dir()?;
+        let cwd_str = cwd.to_string_lossy().to_string();
+        Ok(Some(match kind {
+            ProviderKind::Claude => ClaudeProvider::encode_project_path(&cwd_str),
+            ProviderKind::Codex => cwd_str,
+        }))
+    }
+}
+
+impl SessionProvider for SelectedProvider {
+    fn discover_sessions(
+        &self,
+        project_filter: Option<&str>,
+        since_days: Option<u64>,
+    ) -> Result<Vec<PathBuf>> {
+        match self {
+            Self::Claude(provider) => provider.discover_sessions(project_filter, since_days),
+            Self::Codex(provider) => provider.discover_sessions(project_filter, since_days),
+        }
+    }
+
+    fn extract_commands(&self, path: &Path) -> Result<Vec<ExtractedCommand>> {
+        match self {
+            Self::Claude(provider) => provider.extract_commands(path),
+            Self::Codex(provider) => provider.extract_commands(path),
+        }
+    }
 }
 
 pub struct ClaudeProvider;
@@ -117,15 +197,19 @@ impl ClaudeProvider {
 
     /// Encode a filesystem path to Claude Code's directory name format.
     ///
-    /// Claude Code replaces `/`, `.`, `_`, `\`, and any non-ASCII character
-    /// with `-` when computing the project directory slug under `~/.claude/projects/`.
+    /// Claude Code replaces `/`, `.`, `_`, `\`, `:`, ` `, `[`, `]`, and any
+    /// non-ASCII character with `-` when computing the project directory slug
+    /// under `~/.claude/projects/`.
     ///
     /// `/Users/foo/bar`          → `-Users-foo-bar`
     /// `/Users/first.last/bar`   → `-Users-first-last-bar`
     /// `/home/chris/2_project`   → `-home-chris-2-project`
-    /// `C:\Users\foo\bar`        → `C:-Users-foo-bar`
+    /// `C:\Users\foo\bar`        → `C--Users-foo-bar`
     pub fn encode_project_path(path: &str) -> String {
-        const SANITIZED_CHARS: &[char] = &['/', '.', '_', '\\', ' ', '[', ']'];
+        // The drive-letter `:` matters on Windows: every cwd carries one, and if
+        // it isn't sanitized the slug (`C:-...`) never matches Claude's real
+        // folder (`C--...`), so `rtk discover` finds zero sessions for that project.
+        const SANITIZED_CHARS: &[char] = &['/', '.', '_', '\\', ' ', '[', ']', ':'];
 
         path.chars()
             .map(|c| {
@@ -250,6 +334,228 @@ impl SessionProvider for ClaudeProvider {
         for (tool_id, command, sequence_index) in pending_tool_uses {
             let (output_len, output_content, is_error) = tool_results
                 .get(&tool_id)
+                .map(|(len, content, err)| (Some(*len), Some(content.clone()), *err))
+                .unwrap_or((None, None, false));
+
+            commands.push(ExtractedCommand {
+                command,
+                output_len,
+                session_id: session_id.clone(),
+                output_content,
+                is_error,
+                sequence_index,
+            });
+        }
+
+        Ok(commands)
+    }
+}
+
+pub struct CodexProvider;
+
+impl CodexProvider {
+    fn sessions_dir() -> Result<PathBuf> {
+        let home = dirs::home_dir().context("could not determine home directory")?;
+        Ok(home.join(".codex").join("sessions"))
+    }
+
+    fn discover_sessions_in_sessions_dir(
+        sessions_dir: &Path,
+        project_filter: Option<&str>,
+        since_days: Option<u64>,
+    ) -> Result<Vec<PathBuf>> {
+        if !sessions_dir
+            .try_exists()
+            .with_context(|| format!("failed to access {}", sessions_dir.display()))?
+        {
+            return Ok(Vec::new());
+        }
+
+        let cutoff = since_days.map(|days| {
+            SystemTime::now()
+                .checked_sub(Duration::from_secs(days * 86400))
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
+
+        let mut sessions = Vec::new();
+
+        for walk_entry in WalkDir::new(sessions_dir)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let file_path = walk_entry.path();
+            if file_path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+
+            if let Some(cutoff_time) = cutoff {
+                if let Ok(meta) = fs::metadata(file_path) {
+                    if let Ok(mtime) = meta.modified() {
+                        if mtime < cutoff_time {
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if let Some(filter) = project_filter {
+                if !Self::session_matches_project_filter(file_path, filter) {
+                    continue;
+                }
+            }
+
+            sessions.push(file_path.to_path_buf());
+        }
+
+        Ok(sessions)
+    }
+
+    fn session_matches_project_filter(path: &Path, filter: &str) -> bool {
+        let filter = filter.trim();
+        if filter.is_empty() {
+            return true;
+        }
+
+        let Ok(file) = fs::File::open(path) else {
+            return false;
+        };
+        let reader = BufReader::new(file);
+
+        for line in reader.lines().map_while(Result::ok) {
+            if line.contains(filter) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn command_from_codex_arguments(arguments: &serde_json::Value) -> Option<String> {
+        match arguments {
+            serde_json::Value::String(raw) => serde_json::from_str::<serde_json::Value>(raw)
+                .ok()
+                .and_then(|parsed| {
+                    parsed
+                        .get("command")
+                        .and_then(|c| c.as_str())
+                        .map(str::to_string)
+                }),
+            serde_json::Value::Object(_) => arguments
+                .get("command")
+                .and_then(|c| c.as_str())
+                .map(str::to_string),
+            _ => None,
+        }
+    }
+
+    fn output_is_error(output: &str) -> bool {
+        output
+            .lines()
+            .take(3)
+            .find_map(|line| line.strip_prefix("Exit code: "))
+            .is_some_and(|code| code.trim() != "0")
+    }
+}
+
+impl SessionProvider for CodexProvider {
+    fn discover_sessions(
+        &self,
+        project_filter: Option<&str>,
+        since_days: Option<u64>,
+    ) -> Result<Vec<PathBuf>> {
+        let sessions_dir = Self::sessions_dir()?;
+        Self::discover_sessions_in_sessions_dir(&sessions_dir, project_filter, since_days)
+    }
+
+    fn extract_commands(&self, path: &Path) -> Result<Vec<ExtractedCommand>> {
+        let file =
+            fs::File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+        let reader = BufReader::new(file);
+
+        let mut session_id = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        let mut pending_calls: Vec<(String, String, usize)> = Vec::new();
+        let mut call_results: HashMap<String, (usize, String, bool)> = HashMap::new();
+        let mut sequence_counter = 0;
+
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+
+            if !line.contains("\"shell_command\"")
+                && !line.contains("\"function_call_output\"")
+                && !line.contains("\"session_meta\"")
+            {
+                continue;
+            }
+
+            let entry: serde_json::Value = match serde_json::from_str(&line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+
+            if entry.get("type").and_then(|t| t.as_str()) == Some("session_meta") {
+                if let Some(id) = entry
+                    .pointer("/payload/session_id")
+                    .and_then(|i| i.as_str())
+                {
+                    session_id = id.to_string();
+                }
+                continue;
+            }
+
+            if entry.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+                continue;
+            }
+
+            let Some(payload) = entry.get("payload") else {
+                continue;
+            };
+
+            match payload.get("type").and_then(|t| t.as_str()) {
+                Some("function_call")
+                    if payload.get("name").and_then(|n| n.as_str()) == Some("shell_command") =>
+                {
+                    let Some(call_id) = payload.get("call_id").and_then(|i| i.as_str()) else {
+                        continue;
+                    };
+                    let Some(arguments) = payload.get("arguments") else {
+                        continue;
+                    };
+                    let Some(command) = Self::command_from_codex_arguments(arguments) else {
+                        continue;
+                    };
+
+                    pending_calls.push((call_id.to_string(), command, sequence_counter));
+                    sequence_counter += 1;
+                }
+                Some("function_call_output") => {
+                    let Some(call_id) = payload.get("call_id").and_then(|i| i.as_str()) else {
+                        continue;
+                    };
+                    let output = payload.get("output").and_then(|o| o.as_str()).unwrap_or("");
+                    let output_len = output.len();
+                    let content_preview: String = output.chars().take(1000).collect();
+                    let is_error = Self::output_is_error(output);
+
+                    call_results
+                        .insert(call_id.to_string(), (output_len, content_preview, is_error));
+                }
+                _ => {}
+            }
+        }
+
+        let mut commands = Vec::new();
+        for (call_id, command, sequence_index) in pending_calls {
+            let (output_len, output_content, is_error) = call_results
+                .get(&call_id)
                 .map(|(len, content, err)| (Some(*len), Some(content.clone()), *err))
                 .unwrap_or((None, None, false));
 
@@ -403,10 +709,12 @@ mod tests {
 
     #[test]
     fn test_encode_project_path_windows() {
-        // Windows backslashes are also replaced with '-'
+        // Windows backslashes AND the drive-letter colon are replaced with '-'.
+        // A real `C:\Users\foo\bar` dir lands in ~/.claude/projects/C--Users-foo-bar,
+        // so keeping the colon (C:-...) makes project-filtered discover miss it.
         assert_eq!(
             ClaudeProvider::encode_project_path(r"C:\Users\foo\bar"),
-            "C:-Users-foo-bar"
+            "C--Users-foo-bar"
         );
     }
 
@@ -444,6 +752,73 @@ mod tests {
         .unwrap();
 
         assert!(sessions.is_empty());
+    }
+
+    #[test]
+    fn test_extract_codex_shell_command() {
+        let jsonl = make_jsonl(&[
+            r#"{"timestamp":"2026-08-19T02:48:34.328Z","type":"session_meta","payload":{"session_id":"codex-session","cwd":"/tmp/project"}}"#,
+            r#"{"timestamp":"2026-08-19T02:48:47.249Z","type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":"{\"command\":\"rtk git status\",\"workdir\":\"/tmp/project\",\"timeout_ms\":10000}","call_id":"call_1"}}"#,
+            r#"{"timestamp":"2026-08-19T02:48:47.300Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Exit code: 0\nWall time: 0 seconds\nOutput:\nclean\n"}}"#,
+        ]);
+
+        let provider = CodexProvider;
+        let cmds = provider.extract_commands(jsonl.path()).unwrap();
+
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].command, "rtk git status");
+        assert_eq!(cmds[0].session_id, "codex-session");
+        assert_eq!(
+            cmds[0].output_len,
+            Some("Exit code: 0\nWall time: 0 seconds\nOutput:\nclean\n".len())
+        );
+        assert!(!cmds[0].is_error);
+    }
+
+    #[test]
+    fn test_extract_codex_shell_command_error() {
+        let jsonl = make_jsonl(&[
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"shell_command","arguments":{"command":"cargo test","workdir":"/tmp/project"},"call_id":"call_1"}}"#,
+            r#"{"type":"response_item","payload":{"type":"function_call_output","call_id":"call_1","output":"Exit code: 101\nWall time: 1 seconds\nOutput:\nfailed\n"}}"#,
+        ]);
+
+        let provider = CodexProvider;
+        let cmds = provider.extract_commands(jsonl.path()).unwrap();
+
+        assert_eq!(cmds.len(), 1);
+        assert_eq!(cmds[0].command, "cargo test");
+        assert!(cmds[0].is_error);
+    }
+
+    #[test]
+    fn test_codex_discover_sessions_applies_project_filter() {
+        let sessions_dir = tempfile::tempdir().unwrap();
+        let matching_day = sessions_dir.path().join("2026").join("08").join("19");
+        let other_day = sessions_dir.path().join("2026").join("08").join("20");
+        fs::create_dir_all(&matching_day).unwrap();
+        fs::create_dir_all(&other_day).unwrap();
+
+        let matching_file = matching_day.join("matching.jsonl");
+        let other_file = other_day.join("other.jsonl");
+        fs::write(
+            &matching_file,
+            r#"{"type":"session_meta","payload":{"cwd":"/workspace/project-a"}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &other_file,
+            r#"{"type":"session_meta","payload":{"cwd":"/workspace/project-b"}}"#,
+        )
+        .unwrap();
+
+        let sessions = CodexProvider::discover_sessions_in_sessions_dir(
+            sessions_dir.path(),
+            Some("project-a"),
+            Some(30),
+        )
+        .unwrap();
+
+        assert_eq!(sessions, vec![matching_file]);
     }
 
     #[test]

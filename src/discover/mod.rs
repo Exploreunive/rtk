@@ -9,10 +9,10 @@ pub mod rules;
 use anyhow::Result;
 use std::collections::HashMap;
 
-use provider::{ClaudeProvider, SessionProvider};
+use provider::{ProviderKind, SelectedProvider, SessionProvider};
 use registry::{
-    category_avg_tokens, classify_command, split_command_chain, strip_disabled_prefix,
-    Classification,
+    category_avg_tokens, classify_command, command_invokes_rtk, split_command_chain,
+    strip_disabled_prefix, Classification,
 };
 use report::{DiscoverReport, SupportedEntry, UnsupportedEntry};
 
@@ -46,27 +46,22 @@ pub fn run(
     since_days: u64,
     limit: usize,
     format: &str,
+    provider_kind: ProviderKind,
     verbose: u8,
 ) -> Result<()> {
-    let provider = ClaudeProvider;
+    let provider = SelectedProvider::new(provider_kind);
 
     // Determine project filter
-    let project_filter = if all {
-        None
-    } else if let Some(p) = project {
-        Some(p.to_string())
-    } else {
-        // Default: current working directory
-        let cwd = std::env::current_dir()?;
-        let cwd_str = cwd.to_string_lossy().to_string();
-        let encoded = ClaudeProvider::encode_project_path(&cwd_str);
-        Some(encoded)
-    };
+    let project_filter = SelectedProvider::default_project_filter(provider_kind, project, all)?;
 
     let sessions = provider.discover_sessions(project_filter.as_deref(), Some(since_days))?;
 
     if verbose > 0 {
-        eprintln!("Scanning {} session files...", sessions.len());
+        eprintln!(
+            "Scanning {} {} session files...",
+            sessions.len(),
+            provider.label()
+        );
         for s in &sessions {
             eprintln!("  {}", s.display());
         }
@@ -111,6 +106,11 @@ pub fn run(
                             // RTK_DISABLED on unsupported/ignored command — not interesting
                         }
                     }
+                    continue;
+                }
+
+                if command_invokes_rtk(part) {
+                    already_rtk += 1;
                     continue;
                 }
 
@@ -169,10 +169,6 @@ pub fn run(
                         bucket.count += 1;
                     }
                     Classification::Ignored => {
-                        // Check if it starts with "rtk "
-                        if part.trim().starts_with("rtk ") {
-                            already_rtk += 1;
-                        }
                         // Otherwise just skip
                     }
                 }

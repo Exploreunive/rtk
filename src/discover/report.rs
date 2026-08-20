@@ -128,7 +128,7 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
     out.push_str(&"=".repeat(52));
     out.push('\n');
     out.push_str(&format!(
-        "Scanned: {} sessions (last {} days), {} Bash commands\n",
+        "Scanned: {} sessions (last {} days), {} shell commands\n",
         report.sessions_scanned, report.since_days, report.total_commands
     ));
     out.push_str(&format!(
@@ -229,15 +229,15 @@ pub fn format_text(report: &DiscoverReport, limit: usize, verbose: bool) -> Stri
 
 fn append_agent_notes(out: &mut String, status: AgentIntegrationStatus) {
     if status.cursor_hook_installed {
-        out.push_str("\nNote: Cursor sessions are tracked via `rtk gain` (discover scans Claude Code only)\n");
+        out.push_str("\nNote: Cursor sessions are tracked via `rtk gain`; structured transcript scanning is available for supported providers.\n");
     }
 
     if status.hermes_plugin_installed {
-        out.push_str("\nNote: Hermes plugin is installed; Hermes sessions are tracked via `rtk gain` (discover scans Claude Code only)\n");
+        out.push_str("\nNote: Hermes plugin is installed; Hermes sessions are tracked via `rtk gain`; structured transcript scanning is available for supported providers.\n");
     }
 
     if status.copilot_hook_installed {
-        out.push_str("\nNote: GitHub Copilot sessions are tracked via `rtk gain` (discover scans Claude Code only)\n");
+        out.push_str("\nNote: GitHub Copilot sessions are tracked via `rtk gain`; structured transcript scanning is available for supported providers.\n");
     }
 }
 

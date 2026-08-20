@@ -1,8 +1,12 @@
 //! Compares RTK-routed vs raw commands in a coding session.
 
 use crate::core::utils::format_tokens;
-use crate::discover::provider::{ClaudeProvider, ExtractedCommand, SessionProvider};
-use crate::discover::registry::{classify_command, split_command_chain, Classification};
+use crate::discover::provider::{
+    ExtractedCommand, ProviderKind, SelectedProvider, SessionProvider,
+};
+use crate::discover::registry::{
+    classify_command, command_invokes_rtk, split_command_chain, Classification,
+};
 use anyhow::{Context, Result};
 use std::fs;
 use std::path::PathBuf;
@@ -28,19 +32,23 @@ impl SessionSummary {
 /// Count RTK-covered commands from extracted commands.
 /// A command is "covered" if it either:
 /// - starts with "rtk " (explicit rtk invocation), or
-/// - would be rewritten by the hook (classify_command returns Supported)
+/// - would be rewritten by a transparent hook (classify_command returns Supported)
 ///
 /// Chained commands (e.g. "cd ./path && rtk ls") are split so each part
 /// is classified independently — matching the discover module's behavior.
-fn count_rtk_commands(cmds: &[ExtractedCommand]) -> (usize, usize, usize) {
+fn count_rtk_commands(
+    cmds: &[ExtractedCommand],
+    count_supported_as_rewritten: bool,
+) -> (usize, usize, usize) {
     let mut total: usize = 0;
     let mut rtk: usize = 0;
     for c in cmds {
         let parts = split_command_chain(&c.command);
         for part in &parts {
             total += 1;
-            if part.starts_with("rtk ")
-                || matches!(classify_command(part), Classification::Supported { .. })
+            if command_invokes_rtk(part)
+                || (count_supported_as_rewritten
+                    && matches!(classify_command(part), Classification::Supported { .. }))
             {
                 rtk += 1;
             }
@@ -56,15 +64,22 @@ fn progress_bar(pct: f64, width: usize) -> String {
     format!("{}{}", "@".repeat(filled), ".".repeat(empty))
 }
 
-pub fn run(_verbose: u8) -> Result<()> {
-    let provider = ClaudeProvider;
+pub fn run(provider_kind: ProviderKind, _verbose: u8) -> Result<()> {
+    let provider = SelectedProvider::new(provider_kind);
+    let count_supported_as_rewritten = matches!(provider_kind, ProviderKind::Claude);
     let sessions = provider
         .discover_sessions(None, Some(30))
-        .context("Failed to discover Claude Code sessions")?;
+        .with_context(|| format!("Failed to discover {} sessions", provider.label()))?;
 
     if sessions.is_empty() {
-        println!("No Claude Code sessions found in the last 30 days.");
-        println!("Make sure Claude Code has been used at least once.");
+        println!(
+            "No {} sessions found in the last 30 days.",
+            provider.label()
+        );
+        println!(
+            "Make sure {} has been used at least once.",
+            provider.label()
+        );
         return Ok(());
     }
 
@@ -103,7 +118,8 @@ pub fn run(_verbose: u8) -> Result<()> {
             continue;
         }
 
-        let (total_cmds, rtk_cmds, output_tokens) = count_rtk_commands(&cmds);
+        let (total_cmds, rtk_cmds, output_tokens) =
+            count_rtk_commands(&cmds, count_supported_as_rewritten);
 
         // Extract session ID from filename
         let id = path
@@ -145,7 +161,7 @@ pub fn run(_verbose: u8) -> Result<()> {
     }
 
     // Display table
-    let header = "RTK Session Overview (last 10)";
+    let header = format!("RTK Session Overview - {} (last 10)", provider.label());
     println!("{}", header);
     println!("{}", "-".repeat(70));
     println!(
@@ -191,7 +207,7 @@ pub fn run(_verbose: u8) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discover::provider::ExtractedCommand;
+    use crate::discover::provider::{ClaudeProvider, ExtractedCommand};
     use std::io::Write;
     use tempfile::NamedTempFile;
 
@@ -224,7 +240,7 @@ mod tests {
             make_cmd("rtk cargo test", Some(5000)),
             make_cmd("rtk git log -10", Some(800)),
         ];
-        let (total, rtk, output) = count_rtk_commands(&cmds);
+        let (total, rtk, output) = count_rtk_commands(&cmds, false);
         assert_eq!(total, 3);
         assert_eq!(rtk, 3);
         assert_eq!(output, 6000);
@@ -239,10 +255,27 @@ mod tests {
             make_cmd("cargo test", Some(3000)),
             make_cmd("echo hello", Some(100)),
         ];
-        let (total, rtk, output) = count_rtk_commands(&cmds);
+        let (total, rtk, output) = count_rtk_commands(&cmds, true);
         assert_eq!(total, 3);
         // git status + cargo test are supported by RTK, echo is not
         assert_eq!(rtk, 2);
+        assert_eq!(output, 3600);
+    }
+
+    #[test]
+    fn test_count_raw_supported_commands_not_adopted_without_hook() {
+        let cmds = vec![
+            make_cmd("git status", Some(500)),
+            make_cmd("cargo test", Some(3000)),
+            make_cmd("rtk rg TODO", Some(100)),
+        ];
+        let (total, rtk, output) = count_rtk_commands(&cmds, false);
+
+        assert_eq!(total, 3);
+        assert_eq!(
+            rtk, 1,
+            "without a transparent hook, only explicit rtk counts as adoption"
+        );
         assert_eq!(output, 3600);
     }
 
@@ -254,7 +287,7 @@ mod tests {
             make_cmd("rtk cargo test", Some(5000)), // explicit rtk
             make_cmd("echo hello", None),           // not supported
         ];
-        let (total, rtk, output) = count_rtk_commands(&cmds);
+        let (total, rtk, output) = count_rtk_commands(&cmds, true);
         assert_eq!(total, 4);
         assert_eq!(rtk, 3); // rtk git status + git log + rtk cargo test
         assert_eq!(output, 6200);
@@ -267,7 +300,7 @@ mod tests {
             make_cmd("mkdir -p /tmp/foo", Some(10)),
             make_cmd("cd /tmp", Some(5)),
         ];
-        let (total, rtk, _) = count_rtk_commands(&cmds);
+        let (total, rtk, _) = count_rtk_commands(&cmds, false);
         assert_eq!(total, 3);
         assert_eq!(rtk, 0);
     }
@@ -275,7 +308,7 @@ mod tests {
     #[test]
     fn test_count_empty_commands() {
         let cmds: Vec<ExtractedCommand> = vec![];
-        let (total, rtk, output) = count_rtk_commands(&cmds);
+        let (total, rtk, output) = count_rtk_commands(&cmds, false);
         assert_eq!(total, 0);
         assert_eq!(rtk, 0);
         assert_eq!(output, 0);
@@ -288,7 +321,7 @@ mod tests {
         // "cd ./path && rtk ls" is one ExtractedCommand but two logical commands.
         // cd is ignored/unsupported, ls is supported → 1 out of 2 covered.
         let cmds = vec![make_cmd("cd ./your/app/path && rtk ls", Some(200))];
-        let (total, rtk, _) = count_rtk_commands(&cmds);
+        let (total, rtk, _) = count_rtk_commands(&cmds, false);
         assert_eq!(total, 2, "chain should split into 2 commands");
         assert_eq!(rtk, 1, "only 'rtk ls' is RTK-covered");
     }
@@ -297,7 +330,7 @@ mod tests {
     fn test_count_chained_all_supported() {
         // Both parts are RTK-supported
         let cmds = vec![make_cmd("git status && git log -5", Some(500))];
-        let (total, rtk, _) = count_rtk_commands(&cmds);
+        let (total, rtk, _) = count_rtk_commands(&cmds, true);
         assert_eq!(total, 2, "chain should split into 2 commands");
         assert_eq!(rtk, 2, "both git commands are RTK-covered");
     }
@@ -305,7 +338,7 @@ mod tests {
     #[test]
     fn test_count_chained_with_semicolon() {
         let cmds = vec![make_cmd("cd /tmp; git status; echo done", Some(100))];
-        let (total, rtk, _) = count_rtk_commands(&cmds);
+        let (total, rtk, _) = count_rtk_commands(&cmds, true);
         assert_eq!(total, 3, "semicolon chain splits into 3 commands");
         assert_eq!(rtk, 1, "only git status is RTK-covered");
     }
@@ -314,7 +347,7 @@ mod tests {
     fn test_count_chained_no_false_inflation() {
         // Single command should still count as 1
         let cmds = vec![make_cmd("git status", Some(100))];
-        let (total, rtk, _) = count_rtk_commands(&cmds);
+        let (total, rtk, _) = count_rtk_commands(&cmds, true);
         assert_eq!(total, 1);
         assert_eq!(rtk, 1);
     }
@@ -367,7 +400,7 @@ mod tests {
         let provider = ClaudeProvider;
         let cmds = provider.extract_commands(tmp.path()).expect("parse JSONL");
 
-        let (total, rtk, _output) = count_rtk_commands(&cmds);
+        let (total, rtk, _output) = count_rtk_commands(&cmds, true);
         assert_eq!(total, 3, "should find 3 Bash commands");
         // All 3 are RTK-covered: 2 explicit "rtk ..." + 1 hook-rewritten "git log"
         assert_eq!(rtk, 3, "all 3 commands should be RTK-covered");
@@ -391,7 +424,7 @@ mod tests {
         let provider = ClaudeProvider;
         let cmds = provider.extract_commands(tmp.path()).expect("parse JSONL");
 
-        let (total, rtk, _) = count_rtk_commands(&cmds);
+        let (total, rtk, _) = count_rtk_commands(&cmds, false);
         assert_eq!(total, 1, "only Bash tool should be counted");
         assert_eq!(rtk, 1, "the one Bash command is rtk");
     }
@@ -433,7 +466,7 @@ mod tests {
         let cmds = provider.extract_commands(tmp.path()).expect("parse JSONL");
 
         assert_eq!(cmds.len(), 1, "one Bash tool call");
-        let (total, rtk, _) = count_rtk_commands(&cmds);
+        let (total, rtk, _) = count_rtk_commands(&cmds, false);
         assert_eq!(total, 2, "chain splits into cd + rtk ls");
         assert_eq!(rtk, 1, "rtk ls is covered, cd is not");
     }

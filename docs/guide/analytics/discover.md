@@ -9,12 +9,13 @@ sidebar:
 
 ## rtk discover — find missed savings
 
-`rtk discover` analyzes your Claude Code command history to identify commands that ran without RTK filtering, and estimates how much bash output RTK would have removed from them.
+`rtk discover` analyzes structured AI coding session history to identify commands that ran without RTK filtering, and estimates how much shell output RTK would have removed from them. Claude Code is the default provider; Codex sessions can be scanned with `--provider codex`.
 
 ```bash
 rtk discover                    # analyze current project history
 rtk discover --all              # all projects
 rtk discover --all --since 7    # last 7 days, all projects
+rtk discover --provider codex --all --since 7
 ```
 
 **Example output** (sample numbers, not typical results):
@@ -36,12 +37,42 @@ The `~N tokens` figures are **estimated bash output bytes divided by 4**, not to
 
 If commands appear in the missed list after installing RTK, it usually means the hook isn't active for that agent. See [Troubleshooting](../resources/troubleshooting.md) — "Agent not using RTK".
 
+## Codex provider
+
+Codex users often configure RTK through global instructions rather than a shell hook. That makes two analytics questions important:
+
+1. Did the assistant actually use `rtk` in recent Codex sessions?
+2. Which raw commands still produced output that RTK could have compressed?
+
+The Codex provider reads local Codex session transcripts, extracts shell commands from tool calls, and uses the session `cwd` metadata to scope results to the current project by default. Use `--all` when you want account-wide results across projects.
+
+```bash
+rtk session --provider codex
+rtk discover --provider codex
+rtk discover --provider codex --all --since 7
+```
+
+Codex adoption is intentionally conservative. A command is counted as RTK-covered only when it explicitly invokes `rtk`, either locally:
+
+```bash
+rtk git status
+```
+
+or inside a remote SSH payload:
+
+```bash
+ssh build-host 'cd /repo && rtk rg TODO src'
+```
+
+Raw commands such as `git status`, `rg TODO`, or `ssh build-host 'git status'` are reported as missed opportunities when RTK supports the underlying command. This avoids overstating coverage in Codex environments where RTK is policy-driven rather than transparently hook-rewritten.
+
 ## rtk session — adoption tracking
 
-`rtk session` shows RTK adoption across recent Claude Code sessions: how many shell commands ran through RTK vs. raw.
+`rtk session` shows RTK adoption across recent AI coding sessions: how many shell commands ran through RTK vs. raw.
 
 ```bash
 rtk session
+rtk session --provider codex
 ```
 
 **Example output:**

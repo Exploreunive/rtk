@@ -36,6 +36,23 @@
 
 rtk filters and compresses command outputs before they reach your LLM context. Single Rust binary, 100+ supported commands, <10ms overhead.
 
+## Codex Analytics Support
+
+This build adds Codex session analysis to RTK's analytics workflow. It helps users answer three practical questions after configuring RTK for Codex:
+
+- which Codex sessions actually used `rtk` for shell commands;
+- which high-output commands still ran raw and likely wasted context;
+- whether RTK usage is preserved when Codex operates on remote machines through `ssh`.
+
+Use:
+
+```bash
+rtk session --provider codex
+rtk discover --provider codex --all --since 7
+```
+
+Codex does not currently expose the same transparent shell hook semantics as Claude Code, so Codex adoption is counted conservatively: a command is treated as RTK-covered only when the local command or the remote `ssh` payload explicitly invokes `rtk`.
+
 ## What RTK Does
 
 RTK intercepts shell commands and compresses their output before your agent reads it.
