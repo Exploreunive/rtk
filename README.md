@@ -47,11 +47,14 @@ This build adds Codex session analysis to RTK's analytics workflow. It helps use
 Use:
 
 ```bash
+rtk doctor --provider codex
 rtk session --provider codex
 rtk discover --provider codex --all --since 7
 ```
 
 Codex does not currently expose the same transparent shell hook semantics as Claude Code, so Codex adoption is counted conservatively: a command is treated as RTK-covered only when the local command or the remote `ssh` payload explicitly invokes `rtk`.
+
+`rtk doctor --provider codex` is the quickest health check. It scans recent Codex sessions, reports whether RTK is on PATH, shows session coverage, flags raw supported commands, and calls out SSH workflows where RTK should run inside the remote shell.
 
 ## What RTK Does
 

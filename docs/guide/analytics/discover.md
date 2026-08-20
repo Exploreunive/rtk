@@ -1,11 +1,31 @@
 ---
 title: Discover and Session
-description: Find missed savings opportunities with rtk discover, and track RTK adoption with rtk session
+description: Diagnose RTK setup, find missed savings opportunities with rtk discover, and track RTK adoption with rtk session
 sidebar:
   order: 2
 ---
 
-# Discover and Session
+# Doctor, Discover, and Session
+
+## rtk doctor — health check
+
+`rtk doctor` gives a short setup and usage diagnosis for an AI coding session provider. It is designed for answering "is RTK actually being used?" before reading the deeper `session` and `discover` reports.
+
+```bash
+rtk doctor --provider codex
+rtk doctor --provider codex --all --since 7
+rtk doctor --provider codex --all --since 7 --format json
+```
+
+For Codex, the doctor checks recent session transcripts and reports:
+
+- whether `rtk` is available on PATH;
+- how many sessions and shell commands were scanned;
+- how many shell commands explicitly used RTK;
+- whether supported commands still ran raw;
+- whether SSH remote payloads ran supported commands without invoking RTK.
+
+Codex diagnosis is conservative. Because Codex does not expose Claude Code's transparent shell hook semantics, only explicit local or remote `rtk` invocations are treated as covered.
 
 ## rtk discover — find missed savings
 

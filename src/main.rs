@@ -605,6 +605,25 @@ enum Commands {
         provider: discover::provider::ProviderKind,
     },
 
+    /// Diagnose whether RTK is being used by an AI coding session provider
+    Doctor {
+        /// Filter by project path (substring match)
+        #[arg(short, long)]
+        project: Option<String>,
+        /// Scan all projects (default: current project only)
+        #[arg(short, long)]
+        all: bool,
+        /// Limit to sessions from last N days
+        #[arg(short, long, default_value = "7")]
+        since: u64,
+        /// Output format: text, json
+        #[arg(short, long, default_value = "text")]
+        format: String,
+        /// Session provider to scan
+        #[arg(long, value_enum, default_value = "codex")]
+        provider: discover::provider::ProviderKind,
+    },
+
     /// Manage telemetry consent and data (RGPD/GDPR)
     Telemetry {
         #[command(subcommand)]
@@ -2297,6 +2316,24 @@ fn run_cli() -> Result<i32> {
 
         Commands::Session { provider } => {
             analytics::session_cmd::run(provider, cli.verbose)?;
+            0
+        }
+
+        Commands::Doctor {
+            project,
+            all,
+            since,
+            format,
+            provider,
+        } => {
+            discover::doctor::run(
+                provider,
+                project.as_deref(),
+                all,
+                since,
+                &format,
+                cli.verbose,
+            )?;
             0
         }
 

@@ -493,15 +493,17 @@ pub fn command_invokes_rtk(cmd: &str) -> bool {
         return true;
     }
 
-    let tokens = shell_split(trimmed);
-    let Some(first) = tokens.first() else {
-        return false;
-    };
+    extract_ssh_remote_command(trimmed).is_some_and(remote_command_invokes_rtk)
+}
+
+pub fn extract_ssh_remote_command(cmd: &str) -> Option<String> {
+    let tokens = shell_split(cmd.trim());
+    let first = tokens.first()?;
     if first != "ssh" {
-        return false;
+        return None;
     }
 
-    ssh_remote_command(&tokens).is_some_and(remote_command_invokes_rtk)
+    ssh_remote_command(&tokens)
 }
 
 fn remote_command_invokes_rtk(remote: String) -> bool {
